@@ -35,6 +35,9 @@ class CommandMissing(Exception):
 
 def require_command(name, which):
     if not which:
+        import traceback
+        print(traceback.print_stack())
+        print("hi!")
         raise CommandMissing(name)
 
 

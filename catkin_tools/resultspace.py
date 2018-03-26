@@ -28,18 +28,25 @@ except ImportError:
     from pipes import quote as cmd_quote
 
 from osrf_pycommon.process_utils import execute_process
+from osrf_pycommon.process_utils import which
 
 from .common import parse_env_str
 from .common import string_type
 
-DEFAULT_SHELL = '/bin/bash'
+DEFAULT_SHELL = '/bin/bash' if os.name != 'nt' else which('cmd')
 
 # Cache for result-space environments
 # Maps absolute paths to 3-tuples: (base_env, hooks, result_env}
 _resultspace_env_cache = {}
 
 
-def get_resultspace_environment(result_space_path, base_env=None, quiet=False, cached=True, strict=True):
+def get_resultspace_environment(
+    result_space_path,
+    base_env=None,
+    quiet=False,
+    cached=True,
+    strict=True
+):
     """Get the environemt variables which result from sourcing another catkin
     workspace's setup files as the string output of `cmake -E environment`.
     This cmake command is used to be as portable as possible.

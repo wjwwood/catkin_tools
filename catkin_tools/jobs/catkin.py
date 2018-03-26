@@ -14,6 +14,8 @@
 
 import csv
 import os
+import platform
+import sys
 
 try:
     from md5 import md5
@@ -28,17 +30,27 @@ from catkin_tools.execution.jobs import Job
 from catkin_tools.execution.stages import CommandStage
 from catkin_tools.execution.stages import FunctionStage
 
-from .commands.cmake import CMAKE_EXEC
+from .cmake_common import CMAKE_EXECUTABLE
+from .cmake_common import get_configuration_from_cmake
+from .cmake_common import get_visual_studio_version
+from .cmake_common import MAKE_EXECUTABLE
+from .cmake_common import MSBUILD_EXECUTABLE
+from .cmake_common import project_file_exists_at
+from .cmake_common import solution_file_exists_at
+
 from .commands.cmake import CMakeIOBufferProtocol
 from .commands.cmake import CMakeMakeIOBufferProtocol
 from .commands.cmake import get_installed_files
-from .commands.make import MAKE_EXEC
 
 from .utils import copyfiles
 from .utils import loadenv
 from .utils import makedirs
 from .utils import require_command
 from .utils import rmfiles
+
+IS_LINUX = platform.system() == 'Linux'
+IS_MACOS = platform.system() == 'Darwin'
+IS_WINDOWS = os.name == 'nt'
 
 
 def get_prebuild_package(build_space_abs, devel_space_abs, force):
@@ -434,18 +446,34 @@ def create_catkin_build_job(context, package, package_path, dependencies, force_
             prefix=context.package_dest_path(package)
         ))
 
-        require_command('cmake', CMAKE_EXEC)
+        require_command('cmake', CMAKE_EXECUTABLE)
+
+        local_cmake_args = []
+        if IS_WINDOWS:
+            vsv = get_visual_studio_version()
+            if vsv is None:
+                sys.stderr.write(
+                    'VisualStudioVersion is not set, '
+                    'please run within a Visual Studio Command Prompt.\n')
+                raise RuntimeError('Could not determine Visual Studio Version')
+            supported_vsv = {
+                '14.0': 'Visual Studio 14 2015 Win64',
+                '15.0': 'Visual Studio 15 2017 Win64',
+            }
+            if vsv not in supported_vsv:
+                raise RuntimeError('Unknown / unsupported VS version: ' + vsv)
+            local_cmake_args += ['-G', supported_vsv[vsv]]
 
         # CMake command
         stages.append(CommandStage(
             'cmake',
             [
-                CMAKE_EXEC,
+                CMAKE_EXECUTABLE,
                 pkg_dir,
                 '--no-warn-unused-cli',
                 '-DCATKIN_DEVEL_PREFIX=' + devel_space,
                 '-DCMAKE_INSTALL_PREFIX=' + install_space
-            ] + context.cmake_args,
+            ] + local_cmake_args + context.cmake_args,
             cwd=build_space,
             logger_factory=CMakeIOBufferProtocol.factory_factory(pkg_dir),
             occupy_job=True
@@ -468,50 +496,102 @@ def create_catkin_build_job(context, package, package_path, dependencies, force_
     # Determine if the catkin test results env needs to be overridden
     env_overrides = ctr_env if 'test' in make_args else {}
 
-    # Pre-clean command
-    if pre_clean:
-        # TODO: Remove target args from `make_args`
+    if IS_LINUX or IS_MACOS:
+        require_command('make', MAKE_EXEC)
+
+        # Pre-clean command
+        if pre_clean:
+            # TODO: Remove target args from `make_args`
+            stages.append(CommandStage(
+                'preclean',
+                [MAKE_EXEC, 'clean'] + make_args,
+                cwd=build_space,
+            ))
+
+        # Make command
         stages.append(CommandStage(
-            'preclean',
-            [MAKE_EXEC, 'clean'] + make_args,
+            'make',
+            [MAKE_EXEC] + make_args,
             cwd=build_space,
+            env_overrides=env_overrides,
+            logger_factory=CMakeMakeIOBufferProtocol.factory
         ))
 
-    require_command('make', MAKE_EXEC)
+        # Symlink command if using a linked develspace
+        if context.link_devel:
+            stages.append(FunctionStage(
+                'symlink',
+                link_devel_products,
+                locked_resource='symlink-collisions-file',
+                package=package,
+                package_path=package_path,
+                devel_manifest_path=context.package_metadata_path(package),
+                source_devel_path=context.package_devel_space(package),
+                dest_devel_path=context.devel_space_abs,
+                metadata_path=context.metadata_path(),
+                prebuild=prebuild
+            ))
 
-    # Make command
-    stages.append(CommandStage(
-        'make',
-        [MAKE_EXEC] + make_args,
-        cwd=build_space,
-        env_overrides=env_overrides,
-        logger_factory=CMakeMakeIOBufferProtocol.factory
-    ))
-
-    # Symlink command if using a linked develspace
-    if context.link_devel:
-        stages.append(FunctionStage(
-            'symlink',
-            link_devel_products,
-            locked_resource='symlink-collisions-file',
-            package=package,
-            package_path=package_path,
-            devel_manifest_path=context.package_metadata_path(package),
-            source_devel_path=context.package_devel_space(package),
-            dest_devel_path=context.devel_space_abs,
-            metadata_path=context.metadata_path(),
-            prebuild=prebuild
-        ))
-
-    # Make install command, if installing
-    if context.install:
+        # Make install command, if installing
+        if context.install:
+            stages.append(CommandStage(
+                'install',
+                [MAKE_EXEC, 'install'],
+                cwd=build_space,
+                logger_factory=CMakeMakeIOBufferProtocol.factory,
+                locked_resource=None if context.isolate_install else 'installspace'
+            ))
+    elif IS_WINDOWS:
+        cmd = [
+            CMAKE_EXECUTABLE, '--build', build_space,
+            '--config', get_configuration_from_cmake(context.cmake_args, build_space),
+            '--'  # all arguments after this go to msbuild
+        ]
+        env = None
+        # Convert make parallelism flags into msbuild flags
+        msbuild_flags = [
+            x.replace('-j', '/m:') for x in make_args if x.startswith('-j')
+        ]
+        if msbuild_flags:
+            cmd += msbuild_flags
+            # If there is a parallelism flag in msbuild_flags and it's not /m1,
+            # then turn on /MP for the compiler (intra-project parallelism)
+            if any(x.startswith('/m') for x in msbuild_flags) and \
+               '/m:1' not in msbuild_flags:
+                env = dict(os.environ)
+                if 'CL' in env:
+                    # make sure env['CL'] doesn't include an /MP already
+                    if not any(x.startswith('/MP') for x in env['CL'].split(' ')):
+                        env['CL'] += ' /MP'
+                else:  # CL not in environment; let's add it with our flag
+                    env['CL'] = '/MP'
         stages.append(CommandStage(
-            'install',
-            [MAKE_EXEC, 'install'],
+            'msbuild',
+            cmd,
             cwd=build_space,
-            logger_factory=CMakeMakeIOBufferProtocol.factory,
-            locked_resource=None if context.isolate_install else 'installspace'
+            env_overrides=env_overrides,
+            logger_factory=CMakeMakeIOBufferProtocol.factory
         ))
+
+        if context.link_devel:
+            raise NotImplementedError("linked devel not implemented on Windows")
+
+        if context.install:
+            cmd = [
+                CMAKE_EXECUTABLE, '--build', build_space,
+                '--config', get_configuration_from_cmake(context.cmake_args, build_space),
+                '--target', 'install',
+                '--'  # all arguments after this go to msbuild
+            ]
+            stages.append(CommandStage(
+                'install',
+                cmd,
+                cwd=build_space,
+                env_overrides=env_overrides,
+                logger_factory=CMakeMakeIOBufferProtocol.factory
+            ))
+    else:
+        raise RuntimeError("Unsupported OS")
 
     return Job(
         jid=package.name,
@@ -528,7 +608,8 @@ def create_catkin_clean_job(
         dry_run,
         clean_build,
         clean_devel,
-        clean_install):
+        clean_install
+):
     """Generate a Job that cleans a catkin package"""
 
     stages = []

@@ -16,11 +16,9 @@ from __future__ import print_function
 
 from multiprocessing import cpu_count
 from tempfile import mkstemp
-from termios import FIONREAD
 
 import array
 import errno
-import fcntl
 import os
 import re
 import subprocess
@@ -30,6 +28,9 @@ from catkin_tools.common import log
 from catkin_tools.common import version_tuple
 
 from catkin_tools.terminal_color import ColorMapper
+
+from catkin_tools.jobs.commands.make import MAKE_EXEC
+from catkin_tools.jobs.utils import require_command
 
 mapper = ColorMapper()
 clr = mapper.clr
@@ -82,7 +83,11 @@ def test_gnu_make_support():
     os.write(fd, JOBSERVER_SUPPORT_MAKEFILE)
     os.close(fd)
 
-    ret = subprocess.call(['make', '-f', makefile, '-j2'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not MAKE_EXEC:
+        return False
+    ret = subprocess.call(
+        [MAKE_EXEC, '-f', makefile, '-j2'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     os.unlink(makefile)
     return (ret == 0)
@@ -189,7 +194,7 @@ class JobServer(object):
                     cls._load_ok = True
                 else:
                     cls._load_ok = False
-            except NotImplementedError:
+            except (NotImplementedError, AttributeError):
                 cls._load_ok = True
 
         return cls._load_ok
@@ -235,7 +240,8 @@ class JobServer(object):
 
     @classmethod
     def _running_jobs(cls):
-
+        import fcntl
+        from termios import FIONREAD
         try:
             buf = array.array('i', [0])
             if fcntl.ioctl(cls._job_pipe[0], FIONREAD, buf) == 0:

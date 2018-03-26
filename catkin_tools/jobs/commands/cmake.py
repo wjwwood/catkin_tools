@@ -23,7 +23,7 @@ from catkin_tools.execution.events import ExecutionEvent
 from catkin_tools.terminal_color import fmt
 from catkin_tools.terminal_color import sanitize
 
-from catkin_tools.utils import which
+from osrf_pycommon.process_utils import which
 
 CMAKE_EXEC = which('cmake')
 CMAKE_INSTALL_MANIFEST_FILENAME = 'install_manifest.txt'
